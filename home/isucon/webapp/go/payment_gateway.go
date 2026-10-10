@@ -6,11 +6,35 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 )
 
 var erroredUpstream = errors.New("errored upstream")
+
+// 決済APIは評価のたびに呼ばれ、失敗時は1リクエストで最大6往復する。
+// http.DefaultClient のトランスポートは MaxIdleConnsPerHost が2しかないため、
+// 同時リクエストが増えると接続が再利用されず毎回TCPハンドシェイクが走る。
+// Timeout は ctx のキャンセルが効かない場合の保険で、通常はリクエストの
+// ctx（クライアント切断で失効する）のほうが先に効く。
+var paymentGatewayClient = newPaymentGatewayClient()
+
+func newPaymentGatewayClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 512
+	transport.MaxIdleConnsPerHost = 256
+	return &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: transport,
+	}
+}
+
+// 本文を読み切ってから閉じないと、その接続はアイドルプールへ戻らず破棄される
+func closeAndDrain(body io.ReadCloser) {
+	io.Copy(io.Discard, body)
+	body.Close()
+}
 
 type paymentGatewayPostPaymentRequest struct {
 	Amount int `json:"amount"`
@@ -39,11 +63,11 @@ func requestPaymentGatewayPostPayment(ctx context.Context, paymentGatewayURL str
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Authorization", "Bearer "+token)
 
-			res, err := http.DefaultClient.Do(req)
+			res, err := paymentGatewayClient.Do(req)
 			if err != nil {
 				return err
 			}
-			defer res.Body.Close()
+			defer closeAndDrain(res.Body)
 
 			if res.StatusCode != http.StatusNoContent {
 				// エラーが返ってきても成功している場合があるので、社内決済マイクロサービスに問い合わせ
@@ -53,11 +77,11 @@ func requestPaymentGatewayPostPayment(ctx context.Context, paymentGatewayURL str
 				}
 				getReq.Header.Set("Authorization", "Bearer "+token)
 
-				getRes, err := http.DefaultClient.Do(getReq)
+				getRes, err := paymentGatewayClient.Do(getReq)
 				if err != nil {
 					return err
 				}
-				defer res.Body.Close()
+				defer closeAndDrain(getRes.Body)
 
 				// GET /payments は障害と関係なく200が返るので、200以外は回復不能なエラーとする
 				if getRes.StatusCode != http.StatusOK {

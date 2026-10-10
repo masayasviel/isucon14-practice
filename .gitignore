@@ -5,6 +5,7 @@
 !/.codex/
 !/.codex/skills/
 !/.codex/skills/**
+!/docs
 
 # etc配下は再起動のたびに変化するものとセキュリティ関連と関係がないものを除外
 !/etc/

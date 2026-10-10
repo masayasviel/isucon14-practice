@@ -763,34 +763,57 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 func getChairStats(ctx context.Context, tx *sqlx.Tx, chairID string) (appGetNotificationResponseChairStats, error) {
 	stats := appGetNotificationResponseChairStats{}
 
-	// ARRIVED / CARRYING / COMPLETED がすべて記録されたライドだけを1クエリで集計する
-	var result struct {
-		TotalRidesCount int     `db:"total_rides_count"`
-		TotalEvaluation float64 `db:"total_evaluation"`
-	}
-	err := tx.GetContext(
+	rides := []Ride{}
+	err := tx.SelectContext(
 		ctx,
-		&result,
-		`SELECT COUNT(*) AS total_rides_count, COALESCE(SUM(t.evaluation), 0) AS total_evaluation
-		FROM (
-			SELECT r.id, r.evaluation
-			FROM rides r
-			JOIN ride_statuses rs ON rs.ride_id = r.id
-			WHERE r.chair_id = ?
-			GROUP BY r.id, r.evaluation
-			HAVING SUM(rs.status = 'ARRIVED') > 0
-				AND SUM(rs.status = 'CARRYING') > 0
-				AND SUM(rs.status = 'COMPLETED') > 0
-		) t`,
+		&rides,
+		`SELECT * FROM rides WHERE chair_id = ? ORDER BY updated_at DESC`,
 		chairID,
 	)
 	if err != nil {
 		return stats, err
 	}
 
-	stats.TotalRidesCount = result.TotalRidesCount
-	if result.TotalRidesCount > 0 {
-		stats.TotalEvaluationAvg = result.TotalEvaluation / float64(result.TotalRidesCount)
+	totalRideCount := 0
+	totalEvaluation := 0.0
+	for _, ride := range rides {
+		rideStatuses := []RideStatus{}
+		err = tx.SelectContext(
+			ctx,
+			&rideStatuses,
+			`SELECT * FROM ride_statuses WHERE ride_id = ? ORDER BY created_at`,
+			ride.ID,
+		)
+		if err != nil {
+			return stats, err
+		}
+
+		var arrivedAt, pickupedAt *time.Time
+		var isCompleted bool
+		for _, status := range rideStatuses {
+			if status.Status == "ARRIVED" {
+				arrivedAt = &status.CreatedAt
+			} else if status.Status == "CARRYING" {
+				pickupedAt = &status.CreatedAt
+			}
+			if status.Status == "COMPLETED" {
+				isCompleted = true
+			}
+		}
+		if arrivedAt == nil || pickupedAt == nil {
+			continue
+		}
+		if !isCompleted {
+			continue
+		}
+
+		totalRideCount++
+		totalEvaluation += float64(*ride.Evaluation)
+	}
+
+	stats.TotalRidesCount = totalRideCount
+	if totalRideCount > 0 {
+		stats.TotalEvaluationAvg = totalEvaluation / float64(totalRideCount)
 	}
 
 	return stats, nil
@@ -848,34 +871,11 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	// 受付中で、未完了ライドを持たず、位置情報がある椅子を最新位置付きで一括取得する
-	type availableChair struct {
-		ID        string `db:"id"`
-		Name      string `db:"name"`
-		Model     string `db:"model"`
-		Latitude  int    `db:"latitude"`
-		Longitude int    `db:"longitude"`
-	}
-	chairs := []availableChair{}
+	chairs := []Chair{}
 	err = tx.SelectContext(
 		ctx,
 		&chairs,
-		`WITH latest_chair_locations AS (
-			SELECT chair_id, latitude, longitude,
-				ROW_NUMBER() OVER (PARTITION BY chair_id ORDER BY created_at DESC) AS rn
-			FROM chair_locations
-		)
-		SELECT c.id, c.name, c.model, l.latitude, l.longitude
-		FROM chairs c
-		JOIN latest_chair_locations l ON l.chair_id = c.id AND l.rn = 1
-		WHERE c.is_active = TRUE
-			AND c.id NOT IN (
-				SELECT r.chair_id
-				FROM rides r
-				WHERE r.chair_id IS NOT NULL
-					AND COALESCE((SELECT rs.status FROM ride_statuses rs WHERE rs.ride_id = r.id ORDER BY rs.created_at DESC LIMIT 1), '') <> 'COMPLETED'
-			)
-		ORDER BY c.id`,
+		`SELECT * FROM chairs`,
 	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -884,20 +884,72 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 
 	nearbyChairs := []appGetNearbyChairsResponseChair{}
 	for _, chair := range chairs {
-		if calculateDistance(coordinate.Latitude, coordinate.Longitude, chair.Latitude, chair.Longitude) <= distance {
+		if !chair.IsActive {
+			continue
+		}
+
+		rides := []*Ride{}
+		if err := tx.SelectContext(ctx, &rides, `SELECT * FROM rides WHERE chair_id = ? ORDER BY created_at DESC`, chair.ID); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		skip := false
+		for _, ride := range rides {
+			// 過去にライドが存在し、かつ、それが完了していない場合はスキップ
+			status, err := getLatestRideStatus(ctx, tx, ride.ID)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			if status != "COMPLETED" {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+
+		// 最新の位置情報を取得
+		chairLocation := &ChairLocation{}
+		err = tx.GetContext(
+			ctx,
+			chairLocation,
+			`SELECT * FROM chair_locations WHERE chair_id = ? ORDER BY created_at DESC LIMIT 1`,
+			chair.ID,
+		)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		if calculateDistance(coordinate.Latitude, coordinate.Longitude, chairLocation.Latitude, chairLocation.Longitude) <= distance {
 			nearbyChairs = append(nearbyChairs, appGetNearbyChairsResponseChair{
 				ID:    chair.ID,
 				Name:  chair.Name,
 				Model: chair.Model,
 				CurrentCoordinate: Coordinate{
-					Latitude:  chair.Latitude,
-					Longitude: chair.Longitude,
+					Latitude:  chairLocation.Latitude,
+					Longitude: chairLocation.Longitude,
 				},
 			})
 		}
 	}
 
-	retrievedAt := time.Now()
+	retrievedAt := &time.Time{}
+	err = tx.GetContext(
+		ctx,
+		retrievedAt,
+		`SELECT CURRENT_TIMESTAMP(6)`,
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 
 	writeJSON(w, http.StatusOK, &appGetNearbyChairsResponse{
 		Chairs:      nearbyChairs,

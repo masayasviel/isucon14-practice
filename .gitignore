@@ -5,6 +5,9 @@
 !/.codex/
 !/.codex/skills/
 !/.codex/skills/**
+!/.claude/
+!/.claude/skills/
+!/.claude/skills/**
 !/docs
 
 # etc配下は再起動のたびに変化するものとセキュリティ関連と関係がないものを除外
